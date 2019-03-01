@@ -356,6 +356,10 @@ void systemInitialiser(){
     //Status pin to output low
     setPinDir  (statusPin,OUTPUT);
     setPinValue(statusPin, (progMode == PROGMODE) ? HIGH : LOW);
+    #ifdef statusPinShadow_Define
+    setPinDir  (statusPinShdw,OUTPUT);
+    setPinValue(statusPinShdw, (progMode == PROGMODE) ? HIGH : LOW);
+    #endif
 
     //Standalone Speed/IRQ pin to input no-pull-up
     setPinDir  (standalonePin[  STANDALONE_IRQ], INPUT);
@@ -777,6 +781,9 @@ int main(void) {
             if ((decoded == -2) || Serial_available()) { //is there a byte in buffer or we still need to process the previous byte?
                 //Toggle on the LED to indicate activity.
                 togglePin(statusPin);
+                #ifdef statusPinShadow_Define
+                togglePin(statusPinShdw);
+                #endif
                 //See what character we need to parse
                 if (decoded != -2) {
                     //get the next character in buffer
@@ -801,6 +808,9 @@ int main(void) {
             }
             if (loopCount == 0) {
                 setPinValue(statusPin, (progMode == PROGMODE) ? HIGH : LOW);
+                #ifdef statusPinShadow_Define
+                setPinValue(statusPinShdw, (progMode == PROGMODE) ? HIGH : LOW);
+                #endif
             }
             
             //
@@ -958,6 +968,9 @@ int main(void) {
                 
                 //Update status LED
                 togglePin(statusPin); //Toggle status pin at roughly constant rate in basic mode as indicator
+                #ifdef statusPinShadow_Define
+                togglePin(statusPinShdw);
+                #endif
                 
                 //Check the speed
                 byte newBasicHCSpeed = checkBasicHCSpeed();
@@ -1187,13 +1200,13 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
             break;
             
         //Command required for entering programming mode. All other programming commands cannot be used when progMode = 0 (normal ops)
-        case 'O': //set the programming mode.
+        case 'O': //Control GPIO1 or Programming Mode
             if (axis == RA) {
                 //:O commands to the DC axis control GPIO1 (SNAP2 port)
                 setPinValue(snapPin,(buffer[0] - '0'));
                 progModeEntryCount = 0;
             } else {
-                //Only :O commands to the RA axis are accepted.
+                //Only :O commands to the RA axis are accepted. DC enters and controls programming mode on special sequence.
                 progMode = buffer[0] - '0';              //MODES:  0 = Normal Ops (EQMOD). 1 = Validate EEPROM. 2 = Store to EEPROM. 3 = Rebuild EEPROM
                 if (progModeEntryCount < 19) {
                     //If we haven't sent enough entry commands to switch into programming mode
@@ -1204,7 +1217,7 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
                         //Otherwise increment the count of entry requests.
                         progModeEntryCount = progModeEntryCount + 1;
                     }
-                    command = '\0'; //force sending of error packet when not in programming mode (so that EQMOD knows not to use SNAP1 interface.
+                    command = '\0'; //force sending of error packet when not in programming mode (so that EQMOD knows not to use SNAP1 interface).
                 } else {
                     progModeEntryCount = 20;
                     if (progMode != RUNMODE) {
@@ -1384,6 +1397,7 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
 
 
 void motorEnable(byte axis){
+    motorStop(axis,true); //First perform an "emergency" stop which basically disengages the motors and clears all running flags.
     if (axis == RA){
         setPinValue(enablePin[RA],LOW); //IC enabled
         cmd_setFVal(RA,CMD_ENABLED);
