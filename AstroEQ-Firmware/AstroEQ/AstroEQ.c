@@ -56,6 +56,8 @@ byte microstepConf;
 byte driverVersion;
 bool standaloneMode = false; //Initially not in standalone mode (EQMOD mode)
 bool syntaMode = true; //And Synta processing is enabled.
+bool estop = false;
+bool snapPinIsOpenDrain = false;
 
 #define timerCountRate 8000000
 
@@ -189,7 +191,7 @@ void buildModeMapping(byte microsteps, byte driverVersion){
                     break;
                 case 32:
                     // 1/32
-                    modeState[SPEEDNORM] = (( HIGH << MODE2) | ( HIGH << MODE1) | ( HIGH << MODE0));
+                    modeState[SPEEDNORM] = (( HIGH << MODE2) | (  LOW << MODE1) | ( HIGH << MODE0));
                     // 1/4
                     modeState[SPEEDFAST] = ((  LOW << MODE2) | ( HIGH << MODE1) | (  LOW << MODE0));
                     break;
@@ -337,6 +339,8 @@ void systemInitialiser(){
 
     allowAdvancedHCDetection = !EEPROM_readByte(AdvHCEnable_Address);
     
+    snapPinIsOpenDrain = !!EEPROM_readByte(SnapPinOD_Address);
+
     defaultSpeedState = (microstepConf >= 8) ? SPEEDNORM : SPEEDFAST;
     disableGearChange = !EEPROM_readByte(GearEnable_Address);
     canJumpToHighspeed = (microstepConf >= 8) && !disableGearChange; //Gear change is enabled if the microstep mode can change by a factor of 8.
@@ -359,6 +363,12 @@ void systemInitialiser(){
     #ifdef statusPinShadow_Define
     setPinDir  (statusPinShdw,OUTPUT);
     setPinValue(statusPinShdw, (progMode == PROGMODE) ? HIGH : LOW);
+    #endif
+
+    //Emergency-Stop pin to input pull-up
+    #ifdef estopPin_Define
+    setPinDir  (estopPin,INPUT);
+    setPinValue(estopPin, HIGH); //enable pull-up to pull E-stop pin high.
     #endif
 
     //Standalone Speed/IRQ pin to input no-pull-up
@@ -438,7 +448,11 @@ void systemInitialiser(){
 #endif
 
     //Configure SNAP1 GPIO Pin
-    setPinDir  (snapPin, OUTPUT);
+    if (snapPinIsOpenDrain) {
+        setPinDir  (snapPin, INPUT);
+    } else {
+        setPinDir  (snapPin, OUTPUT);
+    }
     setPinValue(snapPin, LOW);
 
     //Configure Polar Scope LED Pin
@@ -491,14 +505,15 @@ unsigned char calculateEEPROMCRC(){
 
 bool checkEEPROM(bool skipCRC){
     char temp[4];
+    unsigned long eepromVernum;
     //First check header:
     EEPROM_readString(temp,3,AstroEQID_Address);
     if(strncmp(temp,"AEQ",3)){
         return false;
     }
     //Then match version number:
-    EEPROM_readString(temp,4,AstroEQVer_Address);
-    if(strncmp(temp,ASTROEQ_VER_STR,4)){
+    eepromVernum = EEPROM_readLong(AstroEQVer_Address);
+    if(eepromVernum != ASTROEQ_VER){
         return false; //EEPROM needs updating...
     }
     //Then validate CRC (unless skipping)
@@ -533,9 +548,9 @@ bool checkEEPROM(bool skipCRC){
 }
 
 void buildEEPROM(){
-    //We initialise with the identifier string
+    //We initialise with the identifier string and version number
     EEPROM_writeString("AEQ",3,AstroEQID_Address);
-    EEPROM_writeString(ASTROEQ_VER_STR,4,AstroEQVer_Address);
+    EEPROM_writeLong(ASTROEQ_VER,AstroEQVer_Address);
     //We don't blank out the EEPROM to allow data recovery when updating firmware to new version.
     //Configuration is now (theoretically) in a valid state, or invalid state with bad crc
 }
@@ -560,6 +575,7 @@ void storeEEPROM(){
     EEPROM_writeByte(!allowAdvancedHCDetection, AdvHCEnable_Address);
     EEPROM_writeInt(cmd.st4DecBacklash, DecBacklash_Address);
     EEPROM_writeByte(cmd.st4SpeedFactor, SpeedFactor_Address);
+    EEPROM_writeByte(snapPinIsOpenDrain, SnapPinOD_Address);
     EEPROM_writeAccelTable(cmd.accelTable[RA],AccelTableLength,AccelTable1_Address);
     EEPROM_writeAccelTable(cmd.accelTable[DC],AccelTableLength,AccelTable2_Address);
     //Then compute and store a valid CRC
@@ -684,6 +700,22 @@ int main(void) {
     
     for(;;){ //Run loop
 
+#ifdef estopPin_Define
+        //If we have an emergency stop pin
+        estop = !getPinValue(estopPin); //Read in the value of the emergency stop pin
+        //Check if emergency stop high
+        if (estop) {
+            if (cmd.stopped[RA] != CMD_STOPPED) {
+                //If RA is not stopped, perform emergency stop.
+                motorStop(RA,STOPEMERGENCY);
+            }
+            if (cmd.stopped[DC] != CMD_STOPPED) {
+                //If DC is not stopped, perform emergency stop.
+                motorStop(DC,STOPEMERGENCY);
+            }
+        }
+#endif
+
         loopCount++; //Counter used to time events based on number of loops.
 
         if (!standaloneMode && (loopCount == 0) && (progMode == RUNMODE)) { 
@@ -691,8 +723,8 @@ int main(void) {
             byte mode = standaloneModeTest();
             if (mode != EQMOD_MODE) {
                 //If we have just entered stand-alone mode, then we enable the motors and configure the mount
-                motorStop(RA, true); //Ensure both motors are stopped
-                motorStop(DC, true);
+                motorStop(RA, STOPEMERGENCY); //Ensure both motors are stopped
+                motorStop(DC, STOPEMERGENCY);
                 
                 //This next bit needs to be atomic
                 byte oldSREG = SREG; 
@@ -816,7 +848,7 @@ int main(void) {
             //
             //ST4 button handling
             //
-            if (!standaloneMode && ((loopCount & 0xFF) == 0)){
+            if (!estop && !standaloneMode && ((loopCount & 0xFF) == 0)){
                 //We only check the ST-4 buttons in EQMOD mode when not doing Go-To, and only every so often - this adds a little bit of debouncing time.
                 //Determine which RA ST4 pin if any
                 char st4Pin = !getPinValue(st4Pins[RA][ST4N]) ? ST4N : (!getPinValue(st4Pins[RA][ST4P]) ? ST4P : ST4O);
@@ -852,7 +884,7 @@ int main(void) {
                     }
                     if ((cmd.stopped[DC] != CMD_STOPPED) && (cmd.dir[DC] != dir)) {
                         //If we are currently moving in the wrong direction
-                        motorStopDC(false); //Stop the Dec motor
+                        motorStopDC(STOPNORMAL); //Stop the Dec motor
                         readyToGo[DC] = MOTION_START_NOTREADY;    //No longer ready to go as we have now deleted any pre-running EQMOD movement.
                         //We don't keep track of last ST4 pin here so that if we were requesting a movement but had to stop
                         //first we can come back in over and over until we have started the movement.
@@ -867,7 +899,7 @@ int main(void) {
                             isST4Move[DC] = true; //Now doing ST4 movement
                         } else if (isST4Move[DC]) {
                             //Otherwise stop th DEC motor
-                            motorStopDC(false);
+                            motorStopDC(STOPNORMAL);
                             isST4Move[DC] = false; //No longer ST4 movement
                         }
                         lastST4Pin[DC] = st4Pin; //Keep track of what the last ST4 pin value was so we can detect a change.
@@ -1011,7 +1043,7 @@ int main(void) {
             //
             //NESW button handling - uses ST4 pins
             //
-            if ((loopCount & 0xFF) == 0){
+            if (!estop && ((loopCount & 0xFF) == 0)){
                 //We only check the buttons every so often - this adds a little bit of debouncing time.
                 //Determine which if any RA ST4 Pin
                 char st4Pin = !getPinValue(st4Pins[RA][ST4N]) ? ST4N : (!getPinValue(st4Pins[RA][ST4P]) ? ST4P : ST4O);
@@ -1028,7 +1060,7 @@ int main(void) {
                     SREG = oldSREG; //End atomic
                     if ((cmd.stopped[RA] != CMD_STOPPED) && (cmd.dir[RA] != dir) && (currentSpeed < cmd.minSpeed[RA])) {
                         //If we are currently moving in the wrong direction and are traveling too fast to instantly reverse
-                        motorStopRA(false);
+                        motorStopRA(STOPNORMAL);
                         //We don't keep track of last ST4 pin here so that if we were requesting a movement but had to stop
                         //first we can come back in over and over until we have started the movement.
                     } else {
@@ -1039,7 +1071,7 @@ int main(void) {
                         cmd_setDir(RA,dir);
                         cmd_updateStepDir(RA,cmd.highSpeedMode[RA] ? cmd.gVal[RA] : 1);
                         if ((st4Pin == ST4O) && (cmd.st4Mode == CMD_ST4_HIGHSPEED)) {
-                            motorStopRA(false); //If no buttons pressed and in high speed mode, we stop entirely rather than going to tracking
+                            motorStopRA(STOPNORMAL); //If no buttons pressed and in high speed mode, we stop entirely rather than going to tracking
                                                 //This ensures that the motors stop if the hand controller is subsequently unplugged.
                         } else {
                             motorStartRA(); //If the motor is currently stopped at this point, this will automatically start them.
@@ -1062,7 +1094,7 @@ int main(void) {
                     SREG = oldSREG; //End atomic
                     if ((cmd.stopped[DC] != CMD_STOPPED) && (cmd.dir[DC] != dir) && (currentSpeed < cmd.minSpeed[DC])) {
                         //If we are currently moving in the wrong direction and are traveling too fast to instantly reverse
-                        motorStopDC(false);
+                        motorStopDC(STOPNORMAL);
                         //We don't keep track of last ST4 pin here so that if we were requesting a movement but had to stop
                         //first we can come back in over and over until we have started the movement.
                     } else {
@@ -1075,7 +1107,7 @@ int main(void) {
                             motorStartDC(); //If the motor is currently stopped at this point, this will automatically start them.
                         } else {
                             //Otherwise stop th DEC motor
-                            motorStopDC(false);
+                            motorStopDC(STOPNORMAL);
                         }
                         lastST4Pin[DC] = st4Pin; //Keep track of what the last ST4 pin value was so we can detect a change.
                     }
@@ -1134,11 +1166,11 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
             SREG = oldSREG;
             break;
         case 'K': //stop the motor, return empty response
-            motorStop(axis,0); //normal ISR based deceleration trigger.
+            motorStop(axis,STOPNORMAL); //normal ISR based deceleration trigger.
             readyToGo[axis] = MOTION_START_NOTREADY;
             break;
         case 'L':
-            motorStop(axis,1); //emergency axis stop.
+            motorStop(axis,STOPEMERGENCY); //emergency axis stop.
             motorDisable(axis); //shutdown driver power.
             break;
         case 'G': //set mode and direction, return empty response
@@ -1202,15 +1234,31 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
         //Command required for entering programming mode. All other programming commands cannot be used when progMode = 0 (normal ops)
         case 'O': //Control GPIO1 or Programming Mode
             if (axis == RA) {
-                //:O commands to the DC axis control GPIO1 (SNAP2 port)
-                setPinValue(snapPin,(buffer[0] - '0'));
-                progModeEntryCount = 0;
+                if (progMode != RUNMODE) {
+                    //:O command for RA in programming mode configures polarity of 
+                    snapPinIsOpenDrain = buffer[0] - '0';
+                } else {
+                    //:O commands to the DC axis control GPIO1 (SNAP2 port)
+                    if (snapPinIsOpenDrain) {
+                        //If open drain, we leave the pin value low
+                        setPinValue(snapPin,LOW);
+                        //And toggle the pin direction instead
+                        setPinDir  (snapPin,  (buffer[0] - '0') ? OUTPUT : INPUT);
+                    } else {
+                        //Otherwise if not open-drain, then we leave pin as an output
+                        setPinDir  (snapPin, OUTPUT);
+                        //And toggle the value.
+                        setPinValue(snapPin,(buffer[0] - '0'));
+                    }
+                    progModeEntryCount = 0;
+                }
             } else {
                 //Only :O commands to the RA axis are accepted. DC enters and controls programming mode on special sequence.
-                progMode = buffer[0] - '0';              //MODES:  0 = Normal Ops (EQMOD). 1 = Validate EEPROM. 2 = Store to EEPROM. 3 = Rebuild EEPROM
-                if (progModeEntryCount < 19) {
-                    //If we haven't sent enough entry commands to switch into programming mode
-                    if ((progMode != PROGMODE) && (progMode != STOREMODE) && (progMode != REBUILDMODE)) {
+                //First check if we are already in programming mode (e.g. if EEPROM failed, or Config Utility has already put us there)
+                if ((progMode == RUNMODE) && (progModeEntryCount < 19)) {
+                    //If we are in run mode, and we've not sent enough commands to enter programming mode
+                    byte requestMode = buffer[0] - '0';
+                    if ((requestMode != PROGMODE) && (requestMode != STOREMODE) && (requestMode != REBUILDMODE)) {
                         //If we sent an entry command that asks for normal operation, reset the entry count.
                         progModeEntryCount = 0;
                     } else {
@@ -1219,11 +1267,12 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
                     }
                     command = '\0'; //force sending of error packet when not in programming mode (so that EQMOD knows not to use SNAP1 interface).
                 } else {
-                    progModeEntryCount = 20;
+                    //Otherwise we are in programming mode, and config utility is sending a command
+                    progMode = buffer[0] - '0'; //Get the command
                     if (progMode != RUNMODE) {
-                        motorStop(RA,1); //emergency axis stop.
+                        motorStop(RA,STOPEMERGENCY); //emergency axis stop.
                         motorDisable(RA); //shutdown driver power.
-                        motorStop(DC,1); //emergency axis stop.
+                        motorStop(DC,STOPEMERGENCY); //emergency axis stop.
                         motorDisable(DC); //shutdown driver power.
                         readyToGo[RA] = MOTION_START_NOTREADY;
                         readyToGo[DC] = MOTION_START_NOTREADY;
@@ -1255,14 +1304,14 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
                         cmd_setsideIVal(axis, synta_hexToLong(buffer)); //store sVal for that axis.
                         break;
                     case 'd': //return the driver version or step mode
-                        if (axis) {
+                        if (axis == DC) {
                             responseData = microstepConf; 
                         } else {
                             responseData = driverVersion;
                         }
                         break;
                     case 'D': //store the driver version and step modes
-                        if (axis) {
+                        if (axis == DC) {
                             microstepConf = synta_hexToByte(buffer); //store step mode.
                             canJumpToHighspeed = (microstepConf >= 8) && !disableGearChange; //Gear change is enabled if the microstep mode can change by a factor of 8.
                         } else {
@@ -1270,14 +1319,21 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
                         }
                         break;
                     case 'r': //return the DEC backlash or st4 speed factor
-                        if (axis) {
+                        if (axis == DC) {
                             responseData = cmd.st4DecBacklash; 
                         } else {
                             responseData = cmd.st4SpeedFactor;
                         }
                         break;
+                    case 'o': //return the snap pin output type
+                        if (axis == RA) {
+                            responseData = snapPinIsOpenDrain;
+                        } else {
+                            command = '\0'; //Unsupported. Return failure
+                        }
+                        break;
                     case 'R': //store the DEC backlash or st4 speed factor
-                        if (axis) {
+                        if (axis == DC) {
                             unsigned long dataIn = synta_hexToLong(buffer); //store step mode.
                             if (dataIn > 65535) {
                                 command = '\0'; //If the step rate is out of range, force an error response packet.
@@ -1306,7 +1362,7 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
                         encodeDirection[axis] = buffer[0] - '0'; //store sVal for that axis.
                         break;
                     case 'q': //return the disableGearChange/allowAdvancedHCDetection setting  
-                        if (axis) {
+                        if (axis == DC) {
                             responseData = disableGearChange; 
                             canJumpToHighspeed = (microstepConf >= 8) && !disableGearChange; //Gear change is enabled if the microstep mode can change by a factor of 8.
                         } else {
@@ -1314,7 +1370,7 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
                         }
                         break;
                     case 'Q': //store the disableGearChange/allowAdvancedHCDetection setting
-                        if (axis) {
+                        if (axis == DC) {
                             disableGearChange = synta_hexToByte(buffer); //store whether we can change gear
                         } else {
                             allowAdvancedHCDetection = synta_hexToByte(buffer); //store whether to allow advanced hand controller detection
@@ -1377,12 +1433,18 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
   
     synta_assembleResponse(buffer, command, responseData); //generate correct response (this is required as is)
     
-    if ((command == 'J') && (progMode == RUNMODE)) { //J tells us we are ready to begin the requested movement.
-        readyToGo[axis] = MOTION_START_REQUESTED; //So signal we are ready to go and when the last movement completes this one will execute.
+    if ((command == 'J') && !estop && (progMode == RUNMODE)) { //J tells us we are ready to begin the requested movement.
+        
+        //Check if the motion is a go-to         
         if (motionIsGoto(cmd.GVal[axis])){
-            //If go-to mode requested
+            //Signal we are ready to start the next motion.
+            readyToGo[axis] = MOTION_START_REQUESTED;
+            //Set go-to mode requested
             cmd_setGotoEn(axis,CMD_ENABLED);
-        }
+        } else if (readyToGo[axis] != MOTION_START_UPDATABLE) {
+            //Otherwise if the axis is not in an updatable state (i.e. it was stopped with :K)
+            readyToGo[axis] = MOTION_START_REQUESTED; //Signal that we are ready to begin the requested movement when the last movement completes.
+        } //Otherwise, if in updatable mode, we ignore the :J command as it must be following an :I command sent to an already running axis (seems to be a GS Server thing. Indi doesn't issue the :J. EQMOD always issues :K first).
     }
     return success;
 }
@@ -1397,7 +1459,7 @@ bool decodeCommand(char command, char* buffer){ //each command is axis specific.
 
 
 void motorEnable(byte axis){
-    motorStop(axis,true); //First perform an "emergency" stop which basically disengages the motors and clears all running flags.
+    motorStop(axis,STOPEMERGENCY); //First perform an "emergency" stop which basically disengages the motors and clears all running flags.
     if (axis == RA){
         setPinValue(enablePin[RA],LOW); //IC enabled
         cmd_setFVal(RA,CMD_ENABLED);
@@ -1584,7 +1646,7 @@ void motorStop(byte motor, byte emergency){
 }
 
 void motorStopRA(bool emergency){
-    if (emergency) {
+    if (emergency != STOPNORMAL) {
         //trigger instant shutdown of the motor in an emergency.
         timerDisable(RA);
         cmd_setGotoEn(RA,CMD_DISABLED); //Not in goto mode.
@@ -1617,7 +1679,7 @@ void motorStopRA(bool emergency){
 }
 
 void motorStopDC(bool emergency){
-    if (emergency) {
+    if (emergency != STOPNORMAL) {
         //trigger instant shutdown of the motor in an emergency.
         timerDisable(DC);
         cmd_setGotoEn(DC,CMD_DISABLED); //Not in goto mode.

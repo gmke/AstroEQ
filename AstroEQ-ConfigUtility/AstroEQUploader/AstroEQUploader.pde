@@ -23,7 +23,7 @@
 */
 
 public final Boolean isBeta = false; //If a beta version.
-public String configVersion = "3.9.0";
+public String configVersion = "3.9.3";
  
 import controlP5.*;
 import processing.serial.*;
@@ -70,7 +70,7 @@ public final static int VARIANT_PROCESSOR = 3;
 public final static int VARIANT_BOOTLOADER = 4;
 public final static int VARIANT_BAUDRATE = 5;
 public final static int VARIANT_FIELDCOUNT = 6;
-public String[][] variants;
+public ArrayList<String[]> variants;
 
 String [] defaultvariant = {"AstroEQV4-DIYBoard(includingKits)","1.0","AstroEQ V4-DIY Board (including Kits)","atmega162","arduino","57600"};
 
@@ -94,13 +94,19 @@ public static boolean isUnix() {
 
 public static String dir() throws URISyntaxException {
   URI path=AstroEQUploader.class.getProtectionDomain().getCodeSource().getLocation().toURI();
-  String name= AstroEQUploader.class.getPackage().getName()+".jar";
+  String name= AstroEQUploader.class.getPackage().getName();
   String path2 = path.getRawPath();
   path2=path2.substring(1);
+  
+  println("Package Name: "+name);
 
   if (path2.contains(".jar"))
   {
-      path2=path2.replace(name, "");
+      path2=path2.replace(name+".jar", "");
+  }
+  if (path2.contains(".exe"))
+  {
+      path2=path2.replace(name+".exe", "");
   }
   return path2;
 } 
@@ -110,12 +116,12 @@ public final static int BORDER_COLOUR = #5070AA;//color(80,112,170);
 
 
 public final static int WINDOW_WIDTH = 510;
-public final static int WINDOW_HEIGHT = 520;
+public final static int WINDOW_HEIGHT = 525;
 public final static int LOGO_HEIGHT = 64;
 public final static int ELEMENT_HEIGHT = 16;
 public final static int TEXTBAR_HEIGHT = 20;
 public final static int FONT_HEIGHT = ELEMENT_HEIGHT-3;
-public final static int CONTROLP5_HEIGHT = 352;
+public final static int CONTROLP5_HEIGHT = 372;
 
 public final Dimensions headerDim    = new Dimensions(0,0,                         0,0,                    WINDOW_WIDTH,LOGO_HEIGHT + 2*TEXTBAR_HEIGHT       );
 public final Dimensions configDim    = new Dimensions(0,LOGO_HEIGHT+TEXTBAR_HEIGHT,0,0,                    WINDOW_WIDTH,TEXTBAR_HEIGHT                       );
@@ -142,7 +148,7 @@ void setup() {
   pixelDensity(displayDensity());
   
   println("Setting Window Size to: "+WINDOW_WIDTH+" x "+WINDOW_HEIGHT);
-  surface.setSize(510, 520); //STUPID F**ing Processing 3.0 not being able to use constants.
+  surface.setSize(510, 525); //STUPID F**ing Processing 3.0 not being able to use constants.
   
   SmoothCanvas sc = (SmoothCanvas) getSurface().getNative();
   jf = (JFrame) sc.getFrame();
@@ -181,15 +187,11 @@ void setup() {
     e.printStackTrace();
   }
   if (isWindows()) {
+    filePath = sketchPath("");
     try {
-      System.loadLibrary("bin/jSSC-2.8");
+      System.loadLibrary("bin/jSSC-2.8-"+System.getProperty("os.arch"));
     } catch (UnsatisfiedLinkError e) {
       e.printStackTrace();
-    }
-    try {
-      filePath = dir() + java.io.File.separator;
-    } catch (Exception e) {
-      filePath = sketchPath("");
     }
     println("Current Dir: " + filePath);
     hexPath = filePath + "hex";      
@@ -248,7 +250,7 @@ void setup() {
   port.setMoveable(false);
   version.setMoveable(false); 
   
-  firmwareVersion = variants[0][VARIANT_VERSION];
+  firmwareVersion = variants.get(0)[VARIANT_VERSION];
   
 }
 
@@ -368,16 +370,16 @@ String[] listFileNames(String dir) {
 }
 
 String[] listVersions() {
-  String versions[] = new String[variants.length];
-  for (int i = 0; i < variants.length; i++) {
-    versions[i] = variants[i][VARIANT_STRINGNAME];
+  String versions[] = new String[variants.size()];
+  for (int i = 0; i < variants.size(); i++) {
+    versions[i] = variants.get(i)[VARIANT_STRINGNAME];
   };
   return versions;
 }
 
 void populateVariants() {
   
-  List<String[]> variantsList = new ArrayList<String[]>();
+  variants = new ArrayList<String[]>();
   
   BufferedReader reader = null;
   println("Populating Firmware Variants");
@@ -401,11 +403,11 @@ void populateVariants() {
       variant = Arrays.copyOf(splitLine, VARIANT_FIELDCOUNT);
       
       println("Variant Found ->\n\t File:" + variant[VARIANT_FILENAME] + ".hex;\n\t Version: " + variant[VARIANT_VERSION] + ";\n\t Name:" + variant[VARIANT_STRINGNAME] + ";\n\t Processor:" + variant[VARIANT_PROCESSOR] + ";\n\t Bootloader:" + variant[VARIANT_BOOTLOADER] + ";\n\t Baud:" + variant[VARIANT_BAUDRATE]);
-      variantsList.add(variant);
+      variants.add(variant);
     }
     reader.close();
-    variants = new String[variantsList.size()][VARIANT_FIELDCOUNT];
-    variants = variantsList.toArray(variants);
+   // variants = new String[variantsList.size()][VARIANT_FIELDCOUNT];
+   // variants = variantsList.toArray(variants);
   } catch (Exception e) {
     e.printStackTrace();
   } finally {
@@ -506,10 +508,11 @@ void controlEvent(ControlEvent theEvent) {
   if(theEvent.isController()) {
     if( theEvent.getName().equals("version") ) {
       boardVersion = (Integer)getScrollableListEventItem(theEvent, "value");
-      curFile = variants[boardVersion][VARIANT_FILENAME];
+      String[] variant = variants.get(boardVersion);
+      curFile = variant[VARIANT_FILENAME];
       print("Board Version: ");
       println(curFile);
-      firmwareVersion = variants[boardVersion][VARIANT_VERSION];
+      firmwareVersion = variant[VARIANT_VERSION];
       
     } else if( theEvent.getName().equals("comport") ) {
       curPort = (String)getScrollableListEventItem(theEvent, "text");
@@ -601,10 +604,11 @@ void avrdudeRun(String myFile, String myPort, int index) {
   
   // remaining avrdude argument creation (hex and comport #)
   String[] args = (String[])avrdude.clone();//new String[avrdude[0].length];
+  String[] variant = variants.get(index);
   
-  args[5] = args[5] + variants[index][VARIANT_PROCESSOR];
-  args[6] = args[6] + variants[index][VARIANT_BOOTLOADER];
-  args[7] = args[7] + variants[index][VARIANT_BAUDRATE];
+  args[5] = args[5] + variant[VARIANT_PROCESSOR];
+  args[6] = args[6] + variant[VARIANT_BOOTLOADER];
+  args[7] = args[7] + variant[VARIANT_BAUDRATE];
   String sourceFile = "" + hexPath + java.io.File.separator + myFile + ".hex";
   if (isWindows()) {
     args[9] = "-P"+"\\\\.\\"+myPort;
